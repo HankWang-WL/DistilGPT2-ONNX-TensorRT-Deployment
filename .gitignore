@@ -1,0 +1,12 @@
+*.pt
+*.onnx
+*.engine
+*.pkl
+__pycache__/
+myenv310/
+*.log
+*.DS_Store
+results/
+benchmark_result.*
+onnx/
+export_onnx.py
