@@ -208,7 +208,60 @@ print(output_texts)
 Always test and validate incremental autoregressive logic thoroughly, ensuring the output tokens match expected sequences when migrating from PyTorch to TensorRT deployment.
 
 ---
+## Memory Binding for TensorRT Inference (Pseudo-code Walkthrough)
 
+Efficient inference with TensorRT requires manual memory management for all model inputs and outputs. Unlike higher-level frameworks, TensorRT expects you to allocate GPU memory, manage host-device transfers, set input/output shapes, and bind memory for every inference call.
+
+This section summarizes the **complete memory binding workflow** as annotated pseudo-code, so any engineer can quickly see the core technical steps without digging through long scripts.
+
+---
+
+### Manual Memory Binding: Step-by-Step (Pseudo-code)
+
+```python
+# (1) Prepare input data (tokenize & pad to numpy, int32)
+input_ids, attention_mask = ...  # [batch, seq], np.int32
+
+# (2) Allocate GPU memory for all inputs/outputs
+input_ids_ptr = cudaMalloc(input_ids.nbytes)
+attention_mask_ptr = cudaMalloc(attention_mask.nbytes)
+output_ptr = cudaMalloc(output_size)
+
+# (3) Copy input data from host (CPU) to device (GPU)
+cudaMemcpy(input_ids_ptr, input_ids, cudaMemcpyHostToDevice)
+cudaMemcpy(attention_mask_ptr, attention_mask, cudaMemcpyHostToDevice)
+
+# (4) Set dynamic binding shapes for each input (if needed)
+context.set_binding_shape(0, input_ids.shape)         # input_ids
+context.set_binding_shape(1, attention_mask.shape)    # attention_mask
+
+# (5) Prepare list of all device pointers (bindings)
+bindings = [input_ids_ptr, attention_mask_ptr, output_ptr]
+
+# (6) Execute inference (synchronously)
+context.execute_v2(bindings)
+cudaDeviceSynchronize()
+
+# (7) Copy output data from device back to host
+cudaMemcpy(output, output_ptr, cudaMemcpyDeviceToHost)
+
+# (8) Free all device memory (avoid memory leaks)
+cudaFree(input_ids_ptr)
+cudaFree(attention_mask_ptr)
+cudaFree(output_ptr)
+```
+
+---
+
+### Key Notes & Best Practices
+
+* **Match all types and shapes**: Input and output arrays must exactly match the engine’s expected shapes and dtypes, or inference will fail.
+* **Always free device memory**: Never leave device pointers unfreed—avoid memory leaks, especially in long-running processes or autoregressive loops.
+* **Profile shapes in advance**: Dynamic shape support means you must set binding shapes before each inference if batch/seq lengths change.
+* **Pre-allocate for efficiency**: For real-time or batch workloads, consider reusing pre-allocated GPU buffers instead of allocating/freeing every step.
+* **Reference**: Full working example in `run_tensorrt.py`.
+
+---
 ## Known Pitfalls & Troubleshooting
 
 The following issues were encountered during this project, with concise explanations and recommended solutions:
@@ -229,18 +282,26 @@ This ensures all dynamic input shapes used during autoregressive inference are s
 *If you forget this, TensorRT will not be able to run incremental generation at all.*
 
 
-### 🔸 **Unsupported Ops during ONNX Export**
+### 🔸 Unsupported Ops during ONNX Export
 
-- Certain PyTorch operations may not have direct equivalents in ONNX.
-- Solution: Verify ops support in advance, and if necessary, replace unsupported ops with equivalent, supported ones, or update PyTorch/ONNX versions to improve compatibility.
+When attempting to export DistilGPT2 using the standard Python `torch.onnx.export` API, I encountered failures due to unsupported operators.
 
-### 🔸 **ONNX Runtime Slower Than Expected**
+**How I discovered the issue:**
 
-- ONNX Runtime may initially appear slower due to extra memory transfers or suboptimal graph optimizations.
-- Solution:  
-  - Ensure you’re explicitly using the CUDAExecutionProvider for GPU execution.  
-  - Check if unnecessary CPU-GPU transfers (Memcpy nodes in logs) exist; reduce them by proper input handling or updating ONNX Runtime/CUDA versions.
-  - Perform warm-up runs before benchmarking to stabilize performance.
+* The export process either crashed or produced ONNX models that failed to run in ONNX Runtime, with error messages indicating missing operator implementations.
+
+**Root cause:**
+
+* Certain operations in DistilGPT2 do not have direct equivalents in standard ONNX, or require special graph optimizations that the default export process cannot handle.
+
+**Resolution:**
+
+* The Hugging Face `transformers.onnx` CLI utility (`python -m transformers.onnx ...`) is specifically optimized for their models.
+* Using this tool, ONNX export completed successfully and the generated model could be executed in ONNX Runtime and TensorRT.
+
+**Lesson:**
+
+> When exporting transformer models, always prefer the official `transformers.onnx` export command. If a direct Python export fails, try the CLI utility—these often include custom handling and optimizations for complex transformer operations.
 
 ### 🔸 **Autoregressive Model Deployment Issues**
 
