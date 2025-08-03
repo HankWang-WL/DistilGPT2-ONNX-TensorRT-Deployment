@@ -143,14 +143,14 @@ We benchmarked DistilGPT2 inference latency across PyTorch, ONNX Runtime, and Te
 **Key Observations:**
 
 - **TensorRT achieves the lowest latency across all settings.**  
-  For example, at `batch=8, seq_len=12`, TensorRT is about 8.27 ms, while PyTorch is 58.4 ms and ONNX Runtime is 98.07 ms—TensorRT is up to 7× faster than PyTorch and over 11× faster than ONNX Runtime.  
+  For example, at batch=8, seq_len=12, TensorRT is about 8.41 ms, while PyTorch is 58.81 ms and ONNX Runtime is 82.46 ms—TensorRT is up to 7× faster than PyTorch and nearly 10× faster than ONNX Runtime. 
   Even at larger batch sizes and sequence lengths, TensorRT consistently provides substantial acceleration.
 
 - **PyTorch latency remains relatively stable with increasing batch size.**  
   PyTorch's backend is highly optimized for batched GPU workloads, so the per-batch overhead is minimized as batch size increases.
 
-- **ONNX Runtime latency increases significantly with batch size and sequence length.**  
-  ONNX Runtime is noticeably slower than both PyTorch and TensorRT in these benchmarks.  
+- **ONNX Runtime latency increases rapidly as batch size and sequence length grow.**  
+  For smaller inputs, ONNX Runtime may sometimes match or even beat PyTorch, but for large batch or long sequence, ONNX Runtime becomes noticeably slower than both PyTorch and TensorRT. 
   **Possible reasons include:**  
   - ONNX Runtime may invoke sub-graph operators or unsupported ops on CPU, resulting in data transfers between CPU and GPU (especially if the CUDAExecutionProvider is not set as the default).  
   - Some graph optimizations available in PyTorch or TensorRT are either not enabled or not as advanced in ONNX Runtime, leading to less efficient GPU kernel usage.
