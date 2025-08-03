@@ -2,6 +2,8 @@
 
 ## Project Overview
 
+> 🚀 This project demonstrates end-to-end Transformer model acceleration on Windows (GTX 1060), with full profiling, debugging, and root cause analysis for ONNX/TensorRT.
+
 DistilGPT2-ONNX-TensorRT-Deployment demonstrates how to accelerate Transformer model inference by exporting a Hugging Face DistilGPT2 model to ONNX and running it with NVIDIA TensorRT. The primary goal is to achieve significantly lower latency compared to standard PyTorch execution, critical for deploying NLP models in real-time applications.
 
 This project focuses on **reproducibility**, clear documentation of every step, fair benchmarking across frameworks (PyTorch vs. ONNX Runtime vs. TensorRT), and practical deployment tips for Windows users. By leveraging TensorRT optimizations, the project achieves dramatic speed-ups for transformer inference while maintaining model output correctness.
@@ -18,11 +20,15 @@ ONNX Runtime (ONNX model inference)
 Convert to TensorRT Engine  
       ↓  
 TensorRT (ultra-fast inference)
+      ↓
+Profiling & Debugging (Nsight, Verbose Logs)
 ```
 * **PyTorch**: Model development and baseline inference.
 * **ONNX**: Intermediate exchange format for cross-framework deployment.
 * **ONNX Runtime**: General-purpose inference backend (supports CPU/GPU).
 * **TensorRT**: NVIDIA GPU-specific, extreme low latency and high throughput.
+* **Nsight Systems**: End-to-end GPU profiling and timeline analysis for all inference backends (PyTorch, ONNX, TensorRT).
+* **ONNX Runtime Verbose Logs**: Operator/device placement trace and debugging; identify CPU fallback, memory copy bottlenecks, and other execution issues.
 
 ---
 
@@ -35,7 +41,14 @@ DistilGPT2-ONNX-TensorRT-Deployment/
 ├── benchmark_all.py       # Script to run all benchmarks & collect performance
 ├── run_pytorch.py         # PyTorch inference script (baseline)
 ├── run_onnx.py            # ONNX Runtime inference script
-└── run_tensorrt.py        # TensorRT inference script (Python API)
+├── run_tensorrt.py        # TensorRT inference script (Python API)
+├── images/
+│   ├── nsight_onnx_memcpy.PNG          # Nsight ONNX memory copy profile
+│   ├── nsight_pytorch_profile.PNG      # Nsight PyTorch profile
+│   └── tensorrt_pipeline_latency.PNG   # TensorRT pipeline latency
+├── nsight_reports/
+│   └── 3benchmark1round.nsys-rep       # Nsight profiling report
+├── README.md                # Documentation
 ```
 
 * **onnx/**: Holds the exported ONNX model.
@@ -143,14 +156,14 @@ We benchmarked DistilGPT2 inference latency across PyTorch, ONNX Runtime, and Te
 **Key Observations:**
 
 - **TensorRT achieves the lowest latency across all settings.**  
-  For example, at `batch=8, seq_len=12`, TensorRT is about 8.27 ms, while PyTorch is 58.4 ms and ONNX Runtime is 98.07 ms—TensorRT is up to 7× faster than PyTorch and over 11× faster than ONNX Runtime.  
+  For example, at batch=8, seq_len=12, TensorRT is about 8.41 ms, while PyTorch is 58.81 ms and ONNX Runtime is 82.46 ms—TensorRT is up to 7× faster than PyTorch and nearly 10× faster than ONNX Runtime. 
   Even at larger batch sizes and sequence lengths, TensorRT consistently provides substantial acceleration.
 
 - **PyTorch latency remains relatively stable with increasing batch size.**  
   PyTorch's backend is highly optimized for batched GPU workloads, so the per-batch overhead is minimized as batch size increases.
 
-- **ONNX Runtime latency increases significantly with batch size and sequence length.**  
-  ONNX Runtime is noticeably slower than both PyTorch and TensorRT in these benchmarks.  
+- **ONNX Runtime latency increases rapidly as batch size and sequence length grow.**  
+  For smaller inputs, ONNX Runtime may sometimes match or even beat PyTorch, but for large batch or long sequence, ONNX Runtime becomes noticeably slower than both PyTorch and TensorRT. 
   **Possible reasons include:**  
   - ONNX Runtime may invoke sub-graph operators or unsupported ops on CPU, resulting in data transfers between CPU and GPU (especially if the CUDAExecutionProvider is not set as the default).  
   - Some graph optimizations available in PyTorch or TensorRT are either not enabled or not as advanced in ONNX Runtime, leading to less efficient GPU kernel usage.
@@ -164,6 +177,81 @@ We benchmarked DistilGPT2 inference latency across PyTorch, ONNX Runtime, and Te
 
 To ensure that TensorRT deployment preserves model correctness, I **explicitly compared the decoded outputs** from TensorRT and the original PyTorch model. For all tested prompts and settings, the decoded sequences matched exactly, confirming that TensorRT inference is **functionally equivalent** to the original model.
 
+
+---
+
+## Profiling & Debugging Analysis
+
+This section documents the **real profiling, debugging, and root cause workflow** used in this project, showing how I tracked down ONNX Runtime performance bottlenecks and validated optimizations using Nsight Systems and verbose logs.
+
+---
+
+### 1. Initial Observation: ONNX Runtime is *Unexpectedly Slow*
+
+* After running the benchmark, ONNX Runtime was **much slower** than both PyTorch and TensorRT, especially at larger batch or sequence lengths.
+* **Question:** Why is ONNX Runtime so much slower, even with CUDAExecutionProvider enabled?
+
+### 2. Visual Profiling with Nsight Systems
+
+* Used Nsight Systems to capture a GPU timeline for a single inference run (`repeat=1`, with NVTX range annotation).
+* **Observation:**
+
+  * The ONNX timeline shows **long, repeated `cudaMemcpyAsync`** (red bars), causing overall pipeline latency to be much longer than expected.
+  * By contrast, TensorRT and PyTorch timelines showed mostly uniform kernel executions with minimal memory copy events.
+* ![ONNX: Excessive cudaMemcpyAsync Memory Copies](images/nsight_onnx_memcpy.PNG)
+
+### 3. Deep Dive: ONNX Verbose Logging
+
+* Ran ONNX inference with **verbose logging** (`log_severity_level=0`), saved logs to file, and searched for `Memcpy` or `CPUExecutionProvider`.
+* **Key log messages:**
+
+  ```
+  [W:onnxruntime:, transformer_memcpy.cc:83 ...] 6 Memcpy nodes are added to the graph main_graph for CUDAExecutionProvider. It might have negative impact on performance...
+  Add Memcpy From Host after ... for CUDAExecutionProvider
+  ```
+
+### 4. Root Cause: Operator Placement & Memory Transfers
+
+* The **timeline and logs together confirm**:
+
+  * Some ops or outputs are still on CPU, requiring repeated host-device memory copies.
+  * This creates `cudaMemcpyAsync` bottlenecks, as seen in the timeline.
+* These memory transfers **dramatically increase latency**, even if most computation is on GPU.
+
+### 5. Comparison: TensorRT and PyTorch Baselines
+
+* The same profiling workflow for TensorRT and PyTorch:
+
+  * Both showed efficient GPU usage and minimal transfer overhead.
+* ![TensorRT: Efficient Pipeline, No Transfer Bottleneck](images/tensorrt_pipeline_latency.PNG)
+* ![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
+
+### 6. Lessons & Optimization Tips
+
+* **Always validate operator/device placement**: Ensure all operators are supported on the desired device, or use model fusion or graph surgery to avoid CPU fallback.
+* **Use visual profiling and verbose logs**: They quickly expose root causes for latency.
+* **Document with evidence**: Annotated screenshots (timeline, logs) make your story convincing.
+
+---
+
+### Example Key Findings (for README summary)
+
+* ONNX Runtime can have much higher latency if ops fallback to CPU, which triggers excessive host-device memory copies (red `cudaMemcpyAsync` blocks).
+* Verbose logs are essential to confirm device placement and diagnose execution bottlenecks.
+* TensorRT and PyTorch, when properly configured, achieve higher GPU utilization and lower, more predictable latency.
+
+---
+
+### Where to Find Reports and Images
+
+* Key timeline screenshots: [`images/`](images/)
+* Nsight Systems reports: [`nsight_reports/`](nsight_reports/)
+* You can reproduce or review the analysis by opening these resources.
+
+---
+
+**Takeaway**:
+This project shows not just the *what* (performance numbers), but also the *how* (profiling, root cause analysis, debug evidence). This workflow is a blueprint for troubleshooting and optimizing any AI inference pipeline on GPU.
 
 ---
 

@@ -11,3 +11,4 @@ benchmark_result.*
 onnx/
 export_onnx.py
 ~$*
+onnx_verbose.*

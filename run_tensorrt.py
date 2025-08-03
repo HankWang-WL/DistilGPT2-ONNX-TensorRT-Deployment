@@ -3,6 +3,7 @@ import ctypes
 import numpy as np
 from transformers import AutoTokenizer
 import time
+import nvtx
 
 def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
     CUDA_DLL_PATH = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin\cudart64_12.dll"
@@ -88,47 +89,48 @@ def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
             cuda.cudaFree(d_attention_mask)
             cuda.cudaFree(d_output)
     # ==== benchmark ====
-    for _ in range(repeat):
-        cur_input_ids = input_ids.copy()
-        cur_attn_mask = attention_mask.copy()
-        batch, seq = cur_input_ids.shape
+    with nvtx.annotate("TensorRT Benchmark", color="red"):
+        for _ in range(repeat):
+            cur_input_ids = input_ids.copy()
+            cur_attn_mask = attention_mask.copy()
+            batch, seq = cur_input_ids.shape
 
-        # allocate output
-        for _ in range(seq_len):
-            context.set_binding_shape(0, cur_input_ids.shape)
-            context.set_binding_shape(1, cur_attn_mask.shape)
+            # allocate output
+            for _ in range(seq_len):
+                context.set_binding_shape(0, cur_input_ids.shape)
+                context.set_binding_shape(1, cur_attn_mask.shape)
 
-            d_input_ids = malloc_buf(cur_input_ids)
-            d_attention_mask = malloc_buf(cur_attn_mask)
-            output_shape = (batch, cur_input_ids.shape[1], vocab_size)
-            output = np.empty(output_shape, dtype=np.float32)
-            d_output = malloc_buf(output)
+                d_input_ids = malloc_buf(cur_input_ids)
+                d_attention_mask = malloc_buf(cur_attn_mask)
+                output_shape = (batch, cur_input_ids.shape[1], vocab_size)
+                output = np.empty(output_shape, dtype=np.float32)
+                d_output = malloc_buf(output)
 
-            bindings = [int(d_input_ids.value), int(d_attention_mask.value), int(d_output.value)]
+                bindings = [int(d_input_ids.value), int(d_attention_mask.value), int(d_output.value)]
 
-            memcpy_htod(d_input_ids, cur_input_ids)
-            memcpy_htod(d_attention_mask, cur_attn_mask)
+                memcpy_htod(d_input_ids, cur_input_ids)
+                memcpy_htod(d_attention_mask, cur_attn_mask)
 
-            start = time.time()
-            context.execute_v2(bindings)
-            cuda.cudaDeviceSynchronize()
-            end = time.time()
+                start = time.time()
+                context.execute_v2(bindings)
+                cuda.cudaDeviceSynchronize()
+                end = time.time()
 
-            memcpy_dtoh(output, d_output)
+                memcpy_dtoh(output, d_output)
 
-            # greedy
-            next_token_logits = output[:, -1, :]
-            next_token = np.argmax(next_token_logits, axis=-1).astype(np.int32)
-            cur_input_ids = np.concatenate([cur_input_ids, next_token[:, None]], axis=1)
-            cur_attn_mask = np.concatenate([cur_attn_mask, np.ones((batch, 1), dtype=np.int32)], axis=1)
+                # greedy
+                next_token_logits = output[:, -1, :]
+                next_token = np.argmax(next_token_logits, axis=-1).astype(np.int32)
+                cur_input_ids = np.concatenate([cur_input_ids, next_token[:, None]], axis=1)
+                cur_attn_mask = np.concatenate([cur_attn_mask, np.ones((batch, 1), dtype=np.int32)], axis=1)
 
-            # free memory
-            cuda.cudaFree(d_input_ids)
-            cuda.cudaFree(d_attention_mask)
-            cuda.cudaFree(d_output)
+                # free memory
+                cuda.cudaFree(d_input_ids)
+                cuda.cudaFree(d_attention_mask)
+                cuda.cudaFree(d_output)
 
-        latencies.append((end - start) * 1000)
-        decodes.append(tokenizer.batch_decode(cur_input_ids, skip_special_tokens=True))
+            latencies.append((end - start) * 1000)
+            decodes.append(tokenizer.batch_decode(cur_input_ids, skip_special_tokens=True))
 
     avg_lat = sum(latencies) / repeat
     shape = cur_input_ids.shape
