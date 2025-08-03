@@ -56,7 +56,38 @@ def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
     vocab_size = 50257
     latencies = []
     decodes = []
+    # ==== Warmup====
+    for _ in range(10):
+        cur_input_ids = input_ids.copy()
+        cur_attn_mask = attention_mask.copy()
+        batch, seq = cur_input_ids.shape
+        for _ in range(seq_len):
+            context.set_binding_shape(0, cur_input_ids.shape)
+            context.set_binding_shape(1, cur_attn_mask.shape)
 
+            d_input_ids = malloc_buf(cur_input_ids)
+            d_attention_mask = malloc_buf(cur_attn_mask)
+            output_shape = (batch, cur_input_ids.shape[1], vocab_size)
+            output = np.empty(output_shape, dtype=np.float32)
+            d_output = malloc_buf(output)
+
+            bindings = [int(d_input_ids.value), int(d_attention_mask.value), int(d_output.value)]
+
+            memcpy_htod(d_input_ids, cur_input_ids)
+            memcpy_htod(d_attention_mask, cur_attn_mask)
+
+            context.execute_v2(bindings)
+            cuda.cudaDeviceSynchronize()
+
+            next_token_logits = output[:, -1, :]
+            next_token = np.argmax(next_token_logits, axis=-1).astype(np.int32)
+            cur_input_ids = np.concatenate([cur_input_ids, next_token[:, None]], axis=1)
+            cur_attn_mask = np.concatenate([cur_attn_mask, np.ones((batch, 1), dtype=np.int32)], axis=1)
+
+            cuda.cudaFree(d_input_ids)
+            cuda.cudaFree(d_attention_mask)
+            cuda.cudaFree(d_output)
+    # ==== benchmark ====
     for _ in range(repeat):
         cur_input_ids = input_ids.copy()
         cur_attn_mask = attention_mask.copy()

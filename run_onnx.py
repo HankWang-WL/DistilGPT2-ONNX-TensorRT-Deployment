@@ -13,7 +13,14 @@ def run_onnx_benchmark(prompt, batch_size, seq_len, repeat):
     inputs = tokenizer([prompt] * batch_size, return_tensors="np", padding=True)
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
-
+    # ==== Warmup====
+    for _ in range(10):
+        input_feed = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        session.run(None, input_feed)
+        
     latencies = []
     decodes = []
     vocab_size = 50257

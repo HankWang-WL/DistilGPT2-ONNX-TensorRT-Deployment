@@ -10,3 +10,4 @@ results/
 benchmark_result.*
 onnx/
 export_onnx.py
+~$*

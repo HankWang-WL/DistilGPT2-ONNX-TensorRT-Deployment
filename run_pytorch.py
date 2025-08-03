@@ -12,7 +12,9 @@ def run_pytorch_benchmark(prompt, batch_size, seq_len, repeat):
 
     # Warmup
     with torch.no_grad():
-        _ = model.generate(**inputs, max_new_tokens=seq_len)
+        for _ in range(10):
+            _ = model.generate(**inputs, max_new_tokens=seq_len)
+            torch.cuda.synchronize()
 
     latencies = []
     outputs = []
