@@ -223,8 +223,27 @@ This section documents the **real profiling, debugging, and root cause workflow*
 * The same profiling workflow for TensorRT and PyTorch:
 
   * Both showed efficient GPU usage and minimal transfer overhead.
-* ![TensorRT: Efficient Pipeline, No Transfer Bottleneck](images/tensorrt_pipeline_latency.PNG)
-* ![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
+* Pytorch Nsight
+  ![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
+* TensorRT Nsight
+  ![TensorRT: Efficient Pipeline, No Transfer Bottleneck](images/tensorrt_pipeline_latency.PNG)
+
+
+**Note on TensorRT Timeline Interpretation:**
+
+In the Nsight Systems profiling result for TensorRT, you may observe a relatively long green block labeled `cudaStreamSynchronize` (or `cudaDeviceSynchronize`) after the main kernel execution.
+
+* **This block represents the host-side time spent waiting for all GPU kernels to finish.** It includes Python-side processing, memory management, and any latency between launching the inference and collecting the results back on CPU.
+* **Only the actual GPU compute (kernel launches) and memory copy operations should be counted toward true inference latency.** The green sync block mostly reflects synchronization and is not part of device-side model execution.
+
+In this benchmark, the reported latency is measured from Python (end-to-end). However, when visually inspecting the Nsight timeline, remember to focus on the colored kernel/memcpy bars as the real GPU execution time, not the entire sync block duration.
+
+**Summary:**
+
+* The **TensorRT core GPU inference time** is much lower than the total timeline duration, and the reported Python timing (latency) matches actual inference step duration.
+* If you see a long sync/wait block, it is *not* a GPU bottleneck but rather host-side overhead (such as waiting for memory copy or process sync).
+* This makes TensorRT's true advantage even more obvious over ONNX Runtime and PyTorch, which often spend extra time in CPU fallback or host-device transfer.
+
 
 ### 6. Lessons & Optimization Tips
 
