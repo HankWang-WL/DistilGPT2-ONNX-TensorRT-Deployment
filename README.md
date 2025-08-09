@@ -127,7 +127,7 @@ trtexec --onnx=onnx/model.onnx --saveEngine=distilgpt2_fp32.engine \
 * The engine accepts inputs **only** within these batch and sequence length ranges; providing a shape outside this profile will trigger runtime errors.
 
 **Tip:**
-* For autoregressive decoding, always feed the full prompt + already generated tokens as `input_ids` and `attention_mask`, up to the max sequence length set here.
+* For autoregressive decoding, always ensure the dynamic shape profile covers the full prompt + generated tokens length. Without this, TensorRT will crash when the sequence grows beyond the profile limit.
 * If you need longer generations, set a larger `--maxShapes` (e.g., `16x64`).
 
 ---
@@ -160,14 +160,10 @@ We benchmarked DistilGPT2 inference latency across PyTorch, ONNX Runtime, and Te
   Even at larger batch sizes and sequence lengths, TensorRT consistently provides substantial acceleration.
 
 - **PyTorch latency remains relatively stable with increasing batch size.**  
-  PyTorch's backend is highly optimized for batched GPU workloads, so the per-batch overhead is minimized as batch size increases.
+  PyTorch runs very efficiently when processing multiple inputs at once on the GPU. Many fixed costs, like kernel launches and memory transfers, don’t grow much with batch size, so increasing the batch size doesn’t cause    a big jump in latency.
 
 - **ONNX Runtime latency increases rapidly as batch size and sequence length grow.**  
-  For smaller inputs, ONNX Runtime may sometimes match or even beat PyTorch, but for large batch or long sequence, ONNX Runtime becomes noticeably slower than both PyTorch and TensorRT. 
-  **Possible reasons include:**  
-  - ONNX Runtime may invoke sub-graph operators or unsupported ops on CPU, resulting in data transfers between CPU and GPU (especially if the CUDAExecutionProvider is not set as the default).  
-  - Some graph optimizations available in PyTorch or TensorRT are either not enabled or not as advanced in ONNX Runtime, leading to less efficient GPU kernel usage.
-  - ONNX Runtime may perform additional memory copies or have less optimized kernel fusion for transformer architectures.
+  For smaller inputs, ONNX Runtime may sometimes match or beat PyTorch, but for large batch or long sequence it becomes noticeably slower than both PyTorch and TensorRT. Profiling and verbose logs show the main cause is     CPU fallback for certain ops, which triggers excessive host–device memory copies (see **Profiling & Debugging Analysis** below for details).
 
 - **TensorRT scales efficiently for both batch size and sequence length.**  
   Even as sequence length grows from 8 to 32, TensorRT's latency increases only modestly (from ~9 ms to 16 ms), while PyTorch and ONNX Runtime latency grows much faster.
@@ -198,6 +194,7 @@ This section documents the **real profiling, debugging, and root cause workflow*
 
   * The ONNX timeline shows **long, repeated `cudaMemcpyAsync`** (red bars), causing overall pipeline latency to be much longer than expected.
   * By contrast, TensorRT and PyTorch timelines showed mostly uniform kernel executions with minimal memory copy events.
+    
 * ![ONNX: Excessive cudaMemcpyAsync Memory Copies](images/nsight_onnx_memcpy.PNG)
 
 ### 3. Deep Dive: ONNX Verbose Logging
@@ -225,24 +222,40 @@ This section documents the **real profiling, debugging, and root cause workflow*
   * Both showed efficient GPU usage and minimal transfer overhead.
 * Pytorch Nsight
   ![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
+  
+
 * TensorRT Nsight
   ![TensorRT: Efficient Pipeline, No Transfer Bottleneck](images/tensorrt_pipeline_latency.PNG)
-
+  
 
 **Note on TensorRT Timeline Interpretation:**
 
-In the Nsight Systems profiling result for TensorRT, you may observe a relatively long green block labeled `cudaStreamSynchronize` (or `cudaDeviceSynchronize`) after the main kernel execution.
+In the Nsight Systems profiling result for TensorRT, the actual device-side cost comes from the **orange** blocks (`ExecutionContext::execute` – GPU kernels) and **red** blocks (`cudaMemcpy` – H2D/D2H memory copies).
 
-* **This block represents the host-side time spent waiting for all GPU kernels to finish.** It includes Python-side processing, memory management, and any latency between launching the inference and collecting the results back on CPU.
-* **Only the actual GPU compute (kernel launches) and memory copy operations should be counted toward true inference latency.** The green sync block mostly reflects synchronization and is not part of device-side model execution.
+* **Green block (`cudaStreamSynchronize` / `cudaDeviceSynchronize`)**
+  Represents the CPU waiting for the GPU to finish the remaining kernels or copies. It overlaps with device activity and is **not additional GPU time**.
 
-In this benchmark, the reported latency is measured from Python (end-to-end). However, when visually inspecting the Nsight timeline, remember to focus on the colored kernel/memcpy bars as the real GPU execution time, not the entire sync block duration.
+⚠ **Python timing caveat:**
+In our Python benchmark, the measured latency only covers `context.execute_v2()` plus `cudaDeviceSynchronize()`. This captures **only the orange GPU kernel execution time**, excluding the red memory transfer times (`cudaMemcpy`) before and after execution.
+As a result, the Python-measured TensorRT latency will appear shorter than the full Nsight timeline, which includes both kernel execution and data transfer overhead.
+
+**Two common latency measurements:**
+
+1. **Pure GPU compute time** – what our Python timing captures. Focuses on raw kernel performance without I/O overhead. Commonly used in TensorRT and NVIDIA benchmarks for performance tuning.
+2. **End-to-end latency (Host latency)** – includes H2D copy → GPU compute → D2H copy. Matches what Nsight shows and reflects real-world deployment.
 
 **Summary:**
 
-* The **TensorRT core GPU inference time** is much lower than the total timeline duration, and the reported Python timing (latency) matches actual inference step duration.
-* If you see a long sync/wait block, it is *not* a GPU bottleneck but rather host-side overhead (such as waiting for memory copy or process sync).
-* This makes TensorRT's true advantage even more obvious over ONNX Runtime and PyTorch, which often spend extra time in CPU fallback or host-device transfer.
+* **Device-side inference time** = orange (`ExecutionContext::execute`) + red (`cudaMemcpy` H2D/D2H copies)
+* Green = host wait, overlapping with device work; **do not add it on top**
+* Python timing (compute-only) is useful for kernel performance comparison, but deployment latency will be higher once data transfer is included
+
+
+**Summary:**
+
+* **Device‑side inference time** = orange (`ExecutionContext::execute`) + red (`cudaMemcpy` H2D/D2H copies)
+* Green = host wait, overlapping with device work; **do not add it on top**
+* End‑to‑end latency (Python/`trtexec`) includes copies + kernels + wait, matching real‑world deployment behavior
 
 
 ### 6. Lessons & Optimization Tips
