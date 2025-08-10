@@ -1,34 +1,45 @@
 # DistilGPT2-ONNX-TensorRT-Deployment
 
+>  This README focuses on **end-to-end (E2E)** latency. It documents how I used Nsight/logs to locate bottlenecks, implemented a **minimal O1 optimization**, and why under this setup **TensorRT (E2E)** is still slower than **PyTorch (E2E)**.
+
+---
+
 ## Project Overview
 
-> 🚀 This project demonstrates end-to-end Transformer model acceleration on Windows (GTX 1060), with full profiling, debugging, and root cause analysis for ONNX/TensorRT.
+This project demonstrates exporting Hugging Face **DistilGPT2** to ONNX and running it with **NVIDIA TensorRT** on Windows (GTX 1060), with rigorous performance analysis.
 
-DistilGPT2-ONNX-TensorRT-Deployment demonstrates how to accelerate Transformer model inference by exporting a Hugging Face DistilGPT2 model to ONNX and running it with NVIDIA TensorRT. The primary goal is to achieve significantly lower latency compared to standard PyTorch execution, critical for deploying NLP models in real-time applications.
+* **Reproducible**: clear env, commands, and settings.
+* **E2E metrics**: compare *real* end‑to‑end latency, not kernel-only time.
+* **Debug → Verify → Tradeoffs**: Nsight Systems + ONNX verbose logs for evidence; apply targeted optimization (O1) and openly describe limitations.
 
-This project focuses on **reproducibility**, clear documentation of every step, fair benchmarking across frameworks (PyTorch vs. ONNX Runtime vs. TensorRT), and practical deployment tips for Windows users. By leveraging TensorRT optimizations, the project achieves dramatic speed-ups for transformer inference while maintaining model output correctness.
+> **Bottom line:** We measure true end-to-end latency. A minimal O1 (pre-alloc + last-step logits only) cuts E2E by 30–43%, but PyTorch `generate` remains faster **because it uses a KV cache (O(L))** while our TRT path is **O(L²)**. **To close the gap, add a KV cache**
 
-### Inference Pipeline Overview
+
+
+---
+
+## Inference Pipeline Overview
 
 ```bash
-PyTorch (native inference)  
-      ↓  
-Export to ONNX  
+PyTorch (native inference)
       ↓
-ONNX Runtime (ONNX model inference)  
-      ↓  
-Convert to TensorRT Engine  
-      ↓  
-TensorRT (ultra-fast inference)
+Export to ONNX
+      ↓
+ONNX Runtime (ONNX inference)
+      ↓
+Build TensorRT Engine
+      ↓
+TensorRT (inference)
       ↓
 Profiling & Debugging (Nsight, Verbose Logs)
 ```
-* **PyTorch**: Model development and baseline inference.
-* **ONNX**: Intermediate exchange format for cross-framework deployment.
-* **ONNX Runtime**: General-purpose inference backend (supports CPU/GPU).
-* **TensorRT**: NVIDIA GPU-specific, extreme low latency and high throughput.
-* **Nsight Systems**: End-to-end GPU profiling and timeline analysis for all inference backends (PyTorch, ONNX, TensorRT).
-* **ONNX Runtime Verbose Logs**: Operator/device placement trace and debugging; identify CPU fallback, memory copy bottlenecks, and other execution issues.
+
+* **PyTorch**: model dev & baseline.
+* **ONNX**: exchange format.
+* **ONNX Runtime**: general purpose engine (CPU/GPU).
+* **TensorRT**: NVIDIA GPU‑specific; manual memory binding & data movement design.
+* **Nsight Systems**: E2E timeline.
+* **ONNX Verbose Logs**: op/device placement & inserted Memcpy nodes.
 
 ---
 
@@ -36,42 +47,36 @@ Profiling & Debugging (Nsight, Verbose Logs)
 
 ```
 DistilGPT2-ONNX-TensorRT-Deployment/
-├── onnx/                  # Contains exported ONNX models (e.g. model.onnx)
-├── distilgpt2_fp32.engine # TensorRT engine file generated from ONNX
-├── benchmark_all.py       # Script to run all benchmarks & collect performance
-├── run_pytorch.py         # PyTorch inference script (baseline)
-├── run_onnx.py            # ONNX Runtime inference script
-├── run_tensorrt.py        # TensorRT inference script (Python API)
+├── onnx/                  # Exported ONNX models
+├── distilgpt2_fp32.engine # TensorRT engine (FP32)
+├── benchmark_all.py       # Run all benchmarks & aggregate
+├── run_pytorch.py         # PyTorch baseline
+├── run_onnx.py            # ONNX Runtime baseline
+├── run_tensorrt.py        # TensorRT baseline (early kernel-only measurement)
+├── run_tensorrt_O1.py     # TensorRT O1 (E2E: prealloc + D2H last-step only)
 ├── images/
-│   ├── nsight_onnx_memcpy.PNG          # Nsight ONNX memory copy profile
-│   ├── nsight_pytorch_profile.PNG      # Nsight PyTorch profile
-│   └── tensorrt_pipeline_latency.PNG   # TensorRT pipeline latency
+│   ├── nsight_onnx_memcpy.PNG
+│   ├── nsight_pytorch_profile.PNG
+│   ├── tensorrt_pipeline_latency.PNG
+│   └── tensorrtO1_pipeline_latency.PNG
 ├── nsight_reports/
-│   └── 3benchmark1round.nsys-rep       # Nsight profiling report
-├── README.md                # Documentation
+│   └── 3benchmark1round.nsys-rep
+└── README.md
 ```
-
-* **onnx/**: Holds the exported ONNX model.
-* **distilgpt2\_fp32.engine**: TensorRT engine file, built with FP32 precision (see commands below).
-* **Python scripts**: Run individual or all benchmarks; aggregate results.
 
 ---
 
 ## Environment & Version Details
 
-All benchmarks and deployment steps were performed on the following environment:
-
-* **OS**: Windows 10 (64-bit)
-* **GPU**: NVIDIA GeForce GTX 1060 3GB (Pascal, Compute Capability 6.1)
+* **OS**: Windows 10 (64‑bit)
+* **GPU**: NVIDIA GeForce GTX 1060 3GB (Pascal, CC 6.1)
 * **Python**: 3.10
 * **PyTorch**: 2.1.0+cu121
 * **Transformers**: 4.40.0
 * **ONNX**: 1.14.1
-* **ONNX Runtime**: 1.14.1 (with CUDA GPU support)
-* **TensorRT**: 8.6.1.6 (latest for Pascal, FP32 only)
-* **CUDA**: 12.0
-* **cuDNN**: 8.x (included with CUDA 12.x)
-* **trtexec.exe**: TensorRT v8.6.1 (CLI for engine building and benchmarking)
+* **ONNX Runtime**: 1.14.1 (CUDA)
+* **TensorRT**: 8.6.1.6 (FP32 only on Pascal)
+* **CUDA**: 12.x
 
 *Check version info in your own environment with:*
 
@@ -127,154 +132,198 @@ trtexec --onnx=onnx/model.onnx --saveEngine=distilgpt2_fp32.engine \
 * The engine accepts inputs **only** within these batch and sequence length ranges; providing a shape outside this profile will trigger runtime errors.
 
 **Tip:**
-* For autoregressive decoding, always feed the full prompt + already generated tokens as `input_ids` and `attention_mask`, up to the max sequence length set here.
+* For autoregressive decoding, always ensure the dynamic shape profile covers the full prompt + generated tokens length. Without this, TensorRT will crash when the sequence grows beyond the profile limit.
 * If you need longer generations, set a larger `--maxShapes` (e.g., `16x64`).
 
 ---
 
-## Benchmark Results
+## Measurement Methodology & Fairness
 
-We benchmarked DistilGPT2 inference latency across PyTorch, ONNX Runtime, and TensorRT under various settings.
+**E2E definition**: One-time **H2D** (Host→Device) for the initial prompt → per-step **Compute** → per-step **D2H** (Device→Host) for the needed result; the whole decode loop is timed.
 
-**Table 1: Latency (ms) for fixed sequence length = 12 tokens, various batch sizes**
+**Why this is not an apples‑to‑apples comparison**:
 
-| batch | seq\_len | PyTorch (ms) | ONNX (ms) | TensorRT (ms) |
-| ----- | -------- | ------------ | --------- | ------------- |
-| 1     | 12       | 56.37        | 34.36     | 7.08          |
-| 8     | 12       | 58.81        | 82.46     | 8.41          |
-| 16    | 12       | 60.45        | 131.51    | 15.65         |
+1. **PyTorch `generate` uses KV cache** (default `use_cache=True`) → per‑step **O(L)**; tensors stay on GPU; **almost no per‑step memcpy**.
+2. **ONNX/TensorRT path here does not use KV cache** → per‑step **O(L²)** recompute; more H2D/D2H overall.
+3. **Sync points**: TRT/ONNX Python loop calls `cudaDeviceSynchronize()` per step, making overlap harder; PyTorch’s internal loop is tighter.
 
-**Table 2: Latency (ms) for fixed batch size = 8, various sequence lengths**
+### Why KV cache ⇒ per-step O(L)
 
-| batch | seq\_len | PyTorch (ms) | ONNX (ms) | TensorRT (ms) |
-| ----- | -------- | ------------ | --------- | ------------- |
-| 8     | 8        | 31.57        | 31.27     | 8.85          |
-| 8     | 16       | 88.35        | 131.67    | 9.07          |
-| 8     | 32       | 205.31       | 474.65    | 16.53         |
+**Context (step t, current length = t):**
+- **With KV cache** – past **K/V** are stored on GPU. At step *t* we compute a new **Q_t**, dot it with cached **K[1..t-1]**, then weight cached **V[1..t-1]**.  
+  ➜ **Per-step cost ≈ O(t)** (linear).
 
+- **Without KV cache** – rebuild full attention for all *t* tokens every step (`t × t` attention).  
+  ➜ **Per-step cost ≈ O(t²)** (quadratic).
 
-**Key Observations:**
+**Complexity summary**
 
-- **TensorRT achieves the lowest latency across all settings.**  
-  For example, at batch=8, seq_len=12, TensorRT is about 8.41 ms, while PyTorch is 58.81 ms and ONNX Runtime is 82.46 ms—TensorRT is up to 7× faster than PyTorch and nearly 10× faster than ONNX Runtime. 
-  Even at larger batch sizes and sequence lengths, TensorRT consistently provides substantial acceleration.
+| Case              | Per-step cost | Total cost up to length L |
+|-------------------|---------------|---------------------------|
+| With KV cache     | **O(L)**      | **O(L²)**                 |
+| Without KV cache  | **O(L²)**     | **O(L³)**                 |
 
-- **PyTorch latency remains relatively stable with increasing batch size.**  
-  PyTorch's backend is highly optimized for batched GPU workloads, so the per-batch overhead is minimized as batch size increases.
-
-- **ONNX Runtime latency increases rapidly as batch size and sequence length grow.**  
-  For smaller inputs, ONNX Runtime may sometimes match or even beat PyTorch, but for large batch or long sequence, ONNX Runtime becomes noticeably slower than both PyTorch and TensorRT. 
-  **Possible reasons include:**  
-  - ONNX Runtime may invoke sub-graph operators or unsupported ops on CPU, resulting in data transfers between CPU and GPU (especially if the CUDAExecutionProvider is not set as the default).  
-  - Some graph optimizations available in PyTorch or TensorRT are either not enabled or not as advanced in ONNX Runtime, leading to less efficient GPU kernel usage.
-  - ONNX Runtime may perform additional memory copies or have less optimized kernel fusion for transformer architectures.
-
-- **TensorRT scales efficiently for both batch size and sequence length.**  
-  Even as sequence length grows from 8 to 32, TensorRT's latency increases only modestly (from ~9 ms to 16 ms), while PyTorch and ONNX Runtime latency grows much faster.
+**KV cache:** lets each new token only attend to history once (linear), instead of rebuilding the whole `t×t` attention every step (quadratic).
 
 
-**Accuracy Verification:**
 
-To ensure that TensorRT deployment preserves model correctness, I **explicitly compared the decoded outputs** from TensorRT and the original PyTorch model. For all tested prompts and settings, the decoded sequences matched exactly, confirming that TensorRT inference is **functionally equivalent** to the original model.
+
+### Nsight Systems (overview)
+
+**PyTorch** — decode loop stays mostly on GPU (few transfers).  
+![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
+
+**ONNX** — many long `cudaMemcpyAsync` (red) → dominant E2E cost.  
+![ONNX: Excessive cudaMemcpyAsync](images/nsight_onnx_memcpy.PNG)
+
+**TensorRT** — green (host waits): including orange (kernels) + red (copies). **E2E includes kernels and copies**.  
+![TensorRT: Pipeline Latency](images/tensorrt_pipeline_latency.PNG)
+
+### GPU Timeline Color Legend & Latency Definitions
+
+**How to read Nsight timelines:**
+- **Orange** = `ExecutionContext::execute` (GPU kernels; device-side compute)
+- **Red** = `cudaMemcpy` （Host→Device（H2D）/ Device→Host（D2H） transfers）
+- **Green** = host/device sync (e.g., `cudaStreamSynchronize`), i.e., CPU waiting; it overlaps with device work and is **not additional GPU time** to be added again.
+
+**Two common latency definitions:**
+1) **Kernel-only** — measure just the GPU compute (e.g., `execute_v2` + a sync). Useful for kernel tuning, but excludes I/O.
+2) **End-to-end (E2E)** — includes H2D → compute → D2H and any required synchronization. This best reflects real deployment behavior and is what this README reports as the primary metric.
+
+
+---
+
+## Debugging Storyline (how I found and fixed the metrics)
+
+1. **Initial observation**: TensorRT looked fast under **kernel-only** timing.
+2. **Switch to E2E**: I timed **H2D → compute → D2H** with NVTX ranges. **Nsight** revealed large memcpy bars and host waits that kernel-only had skipped.
+3. **ONNX logs → hypothesis**: **ONNX verbose logs** showed CPU fallbacks and inserted Memcpy nodes. That explained ONNX’s E2E lag and suggested a direction: **transfers and per-step allocations are the real pain**. *(No TensorRT verbose was used.)*
+4. **Apply the idea on TensorRT (O1)**: After moving to TRT (no CPU fallbacks), Nsight still showed transfers dominating. I implemented **O1**—**pre-allocate** device buffers and **copy back only the last-step logits**—to attack the transfer/alloc overhead directly.
+5. **Results & correctness**: E2E dropped by **30–43%** and Nsight showed shorter memcpy bars. Decoded outputs matched PyTorch **token-by-token**. The main remaining gap is the **missing KV cache** (per-step O(L) vs O(L²)).
+
+> Chain of evidence: kernel-only looked great → switch to E2E → ONNX logs expose CPU fallback/Memcpy → hypothesize transfer/alloc bottleneck → TRT O1 fix → measurable E2E win; remaining gap = KV cache.
+
+---
+
+
+## Benchmark Results (E2E)
+
+### Fixed seq\_len = 12, varying batch
+
+| batch | seq\_len | PyTorch (ms) | ONNX (ms) | TensorRT E2E (ms) | **TensorRT E2E O1 (ms)** |
+| ----: | -------: | -----------: | --------: | ----------------: | -----------------------: |
+|     1 |       12 |        56.37 |     34.36 |             66.61 |       **57.86** (↓13.1%) |
+|     8 |       12 |        58.81 |     82.46 |            105.13 |       **73.24** (↓30.3%) |
+|    16 |       12 |        60.45 |    131.51 |            170.67 |      **102.03** (↓40.2%) |
+
+### Fixed batch = 8, varying seq\_len
+
+| batch | seq\_len | PyTorch (ms) | ONNX (ms) | TensorRT E2E (ms) | **TensorRT E2E O1 (ms)** |
+| ----: | -------: | -----------: | --------: | ----------------: | -----------------------: |
+|     8 |        8 |        31.57 |     31.27 |             50.02 |       **34.22** (↓31.6%) |
+|     8 |       16 |        88.35 |    131.67 |            170.80 |      **110.50** (↓35.3%) |
+|     8 |       32 |       205.31 |    474.65 |            628.14 |      **355.64** (↓43.4%) |
+
+## Accuracy Verification
+
+To validate functional correctness, I compared decoded outputs from the TensorRT path against the original PyTorch model across multiple prompts, batches, and sequence lengths. For all tested settings, the decoded sequences **matched exactly** token-by-token. This confirms the TensorRT deployment preserves model behavior relative to the PyTorch baseline.
+
+
+**Interpretation**
+
+* **O1** (minimal changes) delivers **30–43%** E2E reduction:
+
+  * Change A: **Pre‑allocate & reuse device buffers** (remove per‑step malloc/free).
+  * Change B: **D2H only the last step `[B, vocab_size]` logits** (do not transfer the full `[B, cur_len, vocab_size]`).
+* Still, without **KV cache**, TRT recomputes the whole sequence each step and I/O remains on the critical path → **still slower than PyTorch E2E**.
+
+> Earlier I also measured **kernel‑only** (just `execute_v2` + a sync) and saw very small numbers. Nsight showed that is **not E2E**: real deployments include H2D/D2H. This README reports **E2E** to avoid confusion.
+
+### Sanity check: Kernel‑only vs E2E (TensorRT)
+
+| batch, seq | TRT kernel‑only (ms) | TRT E2E (ms) | TRT E2E O1 (ms) | E2E / Kernel‑only (×) | O1 drop |
+| ---------- | -------------------: | -----------: | --------------: | --------------------: | ------: |
+| b=1,  L=12 |                 7.08 |        66.61 |           57.86 |                 9.41× |   13.1% |
+| b=8,  L=12 |                 8.41 |       105.13 |           73.24 |                12.50× |   30.3% |
+| b=16, L=12 |                15.65 |       170.67 |          102.03 |                10.91× |   40.2% |
+| b=8,  L=8  |                 8.85 |        50.02 |           34.22 |                 5.65× |   31.6% |
+| b=8,  L=16 |                 9.07 |       170.80 |          110.50 |                18.83× |   35.3% |
+| b=8,  L=32 |                16.53 |       628.14 |          355.64 |                38.00× |   43.4% |
+
+> **Read**: kernel‑only reflects GPU kernel time only. **E2E includes H2D/D2H and sync**, hence **5.6–38×** larger than kernel‑only. O1 (pre‑alloc + last‑step logits only) reduces E2E by **30–43%**, but without KV cache the O(L²) recompute and I/O still dominate.
+
+---
+
+## Why TensorRT (E2E) < PyTorch (E2E) here
+
+1. **Different algorithmic path**: PyTorch `generate` uses **KV cache** (O(L)) with an internal GPU loop; the ONNX/TRT path here has **no cache** (O(L²)).
+2. **I/O and sync**: TRT/ONNX perform per‑step H2D/D2H and use sync APIs; PyTorch has near‑zero per‑step I/O.
+3. **Hardware**: GTX 1060 (Pascal, FP32‑only) has weaker copy/compute overlap; the gap is amplified under this design.
 
 
 ---
 
-## Profiling & Debugging Analysis
+## Profiling & Debugging Analysis (evidence)
 
-This section documents the **real profiling, debugging, and root cause workflow** used in this project, showing how I tracked down ONNX Runtime performance bottlenecks and validated optimizations using Nsight Systems and verbose logs.
+### GPU timeline: how to read it (quick legend)
 
----
+* **Orange** = `ExecutionContext::execute` (GPU kernels; device-side compute)
+* **Red** = `cudaMemcpy` (H2D/D2H transfers)
+* **Green** = host/device sync (e.g., `cudaStreamSynchronize`); CPU waiting and overlapping with device work — **do not add it as extra GPU time**.
+* **E2E latency** = kernels **+** copies **+** necessary sync; this is the primary metric reported in this README.
 
-### 1. Initial Observation: ONNX Runtime is *Unexpectedly Slow*
+### Nsight Systems (overview)
 
-* After running the benchmark, ONNX Runtime was **much slower** than both PyTorch and TensorRT, especially at larger batch or sequence lengths.
-* **Question:** Why is ONNX Runtime so much slower, even with CUDAExecutionProvider enabled?
+* **ONNX**: many long `cudaMemcpyAsync` (red) → dominant E2E cost.
+  `images/nsight_onnx_memcpy.PNG`
+* **PyTorch**: decode loop stays mostly on GPU (few transfers).
+  `images/nsight_pytorch_profile.PNG`
+* **TensorRT**: orange (kernels) + red (copies) + green (host waits). **E2E includes kernels and copies**.
+  `images/tensorrt_pipeline_latency.PNG`
 
-### 2. Visual Profiling with Nsight Systems
+### ONNX verbose logs (confirm memcpy & fallback)
 
-* Used Nsight Systems to capture a GPU timeline for a single inference run (`repeat=1`, with NVTX range annotation).
-* **Observation:**
+Representative lines that match what Nsight shows:
 
-  * The ONNX timeline shows **long, repeated `cudaMemcpyAsync`** (red bars), causing overall pipeline latency to be much longer than expected.
-  * By contrast, TensorRT and PyTorch timelines showed mostly uniform kernel executions with minimal memory copy events.
-* ![ONNX: Excessive cudaMemcpyAsync Memory Copies](images/nsight_onnx_memcpy.PNG)
+```
+[W:onnxruntime:, transformer_memcpy.cc:83 ...] 6 Memcpy nodes are added to the graph main_graph for CUDAExecutionProvider. It might have negative impact on performance...
+Add Memcpy From Host after <node_name> for CUDAExecutionProvider
+Add Memcpy To Host before <node_name> for CUDAExecutionProvider
+I: ExecutionFrame ... Using CPUExecutionProvider for <op_name>  (fallback)
+```
 
-### 3. Deep Dive: ONNX Verbose Logging
+### Nsight evidence: O1 reduces memcpy & API overhead
 
-* Ran ONNX inference with **verbose logging** (`log_severity_level=0`), saved logs to file, and searched for `Memcpy` or `CPUExecutionProvider`.
-* **Key log messages:**
+> Same settings: `batch=8, seq_len=32, repeat=1`. Same timeline zoom. NVTX ranges aligned.
 
-  ```
-  [W:onnxruntime:, transformer_memcpy.cc:83 ...] 6 Memcpy nodes are added to the graph main_graph for CUDAExecutionProvider. It might have negative impact on performance...
-  Add Memcpy From Host after ... for CUDAExecutionProvider
-  ```
+**Baseline (TensorRT E2E)**
+![TensorRT E2E Baseline](images/tensorrt_pipeline_latency.PNG)
 
-### 4. Root Cause: Operator Placement & Memory Transfers
+*Caption—Baseline:* in-loop `cudaMalloc/cudaFree` are present; red `cudaMemcpy` bars are long and dense because D2H pulls near the full `[B, cur_len, vocab_size]`. Copies dominate the NVTX window.
 
-* The **timeline and logs together confirm**:
+**O1 (pre-alloc + D2H last step only)**
+![TensorRT E2E O1](images/tensorrtO1_pipeline_latency.PNG)
 
-  * Some ops or outputs are still on CPU, requiring repeated host-device memory copies.
-  * This creates `cudaMemcpyAsync` bottlenecks, as seen in the timeline.
-* These memory transfers **dramatically increase latency**, even if most computation is on GPU.
+*Caption—O1:* pre-allocation removes per-step `cudaMalloc/cudaFree`; D2H shrinks to just the last-step logits `[B, vocab_size]`. Red `cudaMemcpy` bars are visibly shorter and less frequent; E2E drops by **30–43%** in our tables.
 
-### 5. Comparison: TensorRT and PyTorch Baselines
+### Where to find the raw artifacts
 
-* The same profiling workflow for TensorRT and PyTorch:
+* Screenshots: [`images/`](images/)
+* Nsight Systems report(s): [`nsight_reports/`](nsight_reports/)
+* Repro scripts: `run_*` and `benchmark_all.py`
 
-  * Both showed efficient GPU usage and minimal transfer overhead.
-* ![TensorRT: Efficient Pipeline, No Transfer Bottleneck](images/tensorrt_pipeline_latency.PNG)
-* ![PyTorch: GPU Execution Profile](images/nsight_pytorch_profile.PNG)
-
-### 6. Lessons & Optimization Tips
-
-* **Always validate operator/device placement**: Ensure all operators are supported on the desired device, or use model fusion or graph surgery to avoid CPU fallback.
-* **Use visual profiling and verbose logs**: They quickly expose root causes for latency.
-* **Document with evidence**: Annotated screenshots (timeline, logs) make your story convincing.
 
 ---
-
-### Example Key Findings (for README summary)
-
-* ONNX Runtime can have much higher latency if ops fallback to CPU, which triggers excessive host-device memory copies (red `cudaMemcpyAsync` blocks).
-* Verbose logs are essential to confirm device placement and diagnose execution bottlenecks.
-* TensorRT and PyTorch, when properly configured, achieve higher GPU utilization and lower, more predictable latency.
-
----
-
-### Where to Find Reports and Images
-
-* Key timeline screenshots: [`images/`](images/)
-* Nsight Systems reports: [`nsight_reports/`](nsight_reports/)
-* You can reproduce or review the analysis by opening these resources.
-
----
-
-**Takeaway**:
-This project shows not just the *what* (performance numbers), but also the *how* (profiling, root cause analysis, debug evidence). This workflow is a blueprint for troubleshooting and optimizing any AI inference pipeline on GPU.
-
----
-
 
 ## Handling Autoregressive Inference
 
-DistilGPT2 and similar transformer models often perform autoregressive inference, generating text tokens sequentially based on previous outputs. During this deployment, special care was required to handle incremental inference correctly:
+DistilGPT2 decodes tokens step by step.
 
-- **Correct Attention Mask & Input Preparation**:  
-  Each generated token must be appended to previously generated tokens, forming incremental inputs. The attention mask should accurately reflect valid positions to avoid recomputing previous outputs.
+* **Attention mask & inputs**: append the new token each step; mask must reflect valid positions.
+* **Performance**: sequence grows over time. Without KV cache, each step recomputes the whole sequence.
+* **Validation**: compare generated sequences between TensorRT and PyTorch step‑by‑step.
 
-- **Performance Implications**:  
-  Autoregressive inference involves repeated model calls with incrementally growing sequences. TensorRT significantly accelerates each inference step, leading to notable cumulative latency reductions compared to PyTorch and ONNX Runtime.
-
-- **Validation Strategy**:  
-  Accuracy was verified at each step by comparing intermediate model outputs from TensorRT against the PyTorch baseline, ensuring incremental inference correctness was maintained.
-
-**Sample Autoregressive Loop (Key Logic):**
-
-> **Note:**  
-> The following code demonstrates the *logical flow* of autoregressive inference.  
-> For the actual TensorRT engine implementation and API usage,  
-> please refer to [`run_tensorrt.py`](./run_tensorrt.py) in this repository.
+**Sample Autoregressive Loop (Key Logic)**
 
 ```python
 # Assume device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -288,14 +337,11 @@ for _ in range(max_new_tokens):
     generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
     attention_mask = torch.cat([attention_mask, torch.ones_like(next_token_id)], dim=-1)
 
-# To decode output ids:
 output_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-print(output_texts)
 ```
-**Tip:**
-Always test and validate incremental autoregressive logic thoroughly, ensuring the output tokens match expected sequences when migrating from PyTorch to TensorRT deployment.
 
 ---
+
 ## Memory Binding for TensorRT Inference (Pseudo-code Walkthrough)
 
 Efficient inference with TensorRT requires manual memory management for all model inputs and outputs. Unlike higher-level frameworks, TensorRT expects you to allocate GPU memory, manage host-device transfers, set input/output shapes, and bind memory for every inference call.
@@ -349,10 +395,21 @@ cudaFree(output_ptr)
 * **Pre-allocate for efficiency**: For real-time or batch workloads, consider reusing pre-allocated GPU buffers instead of allocating/freeing every step.
 * **Reference**: Full working example in `run_tensorrt.py`.
 
+
 ---
+
 ## Known Pitfalls & Troubleshooting
 
 The following issues were encountered during this project, with concise explanations and recommended solutions:
+
+### 🔸 **Prefer end‑to‑end (E2E) over kernel‑only**
+
+**Why:** Kernel‑only timing omits host↔device transfers Host→Device (H2D) / Device→Host (D2H) and synchronization. In real deployments these costs can be as large—or larger—than the kernel time, so kernel‑only numbers often paint an overly optimistic picture.
+
+**What to report:** Use **E2E latency** as the primary metric: **H2D → compute → D2H + any required sync** across the entire decode loop.
+
+**If you keep kernel‑only:** Put it in an appendix (or a separate file) and label it clearly as "kernel‑only (no transfers, no sync)" to prevent misinterpretation.
+
 
 ### 🔸 **Engine Profile Not Covering Autoregressive Sequence Lengths**
 
@@ -370,7 +427,7 @@ This ensures all dynamic input shapes used during autoregressive inference are s
 *If you forget this, TensorRT will not be able to run incremental generation at all.*
 
 
-### 🔸 Unsupported Ops during ONNX Export
+### 🔸 **Unsupported Ops during ONNX Export**
 
 When attempting to export DistilGPT2 using the standard Python `torch.onnx.export` API, I encountered failures due to unsupported operators.
 
@@ -429,11 +486,34 @@ nvidia-smi
 
 ---
 
+## What Would Close the Gap 
+
+**Enable a KV cache.** During autoregressive decoding, store past Keys/Values on GPU so each new token only attends to history once (**per-step O(L)**) instead of rebuilding full `t×t` attention (**O(L²)**).
+
+How to implement (pick one):
+- **ORT/TRT path with past_key_values**: export `past_key_values` in ONNX and keep a device-resident cache between steps.
+- **TensorRT-LLM**: use its built-in KV cache support (plus fused kernels). **If hardware permits**, this is the most straightforward route on newer GPUs.
+
+This one change aligns the algorithmic path with PyTorch `generate` and is the main lever to reach parity on E2E latency.
+
+
+---
+
+### Key Takeaways
+- We report **end-to-end (E2E)** latency, not kernel-only.
+- **O1** (pre-alloc + last-step logits only) reduces E2E by **30–43%**.
+- PyTorch `generate` is still faster **due to the KV cache (per-step O(L))**; our ORT/TRT path is **O(L²)** without it. **Next step: enable a KV cache** (or move to TensorRT-LLM).
+
+
+
+---
+
 ## Conclusion
 
-Deploying DistilGPT2 with ONNX + TensorRT on Windows with a GTX 1060 dramatically accelerates inference and is **fully reproducible**. We successfully exported the model, built a TensorRT engine, and resolved all major pitfalls (Windows, shape profiles, batch/seq\_len issues).
+This project is about *how* I:
 
-TensorRT inference achieves order-of-magnitude speedups compared to both PyTorch and ONNX Runtime, enabling real-time deployment for NLP applications on consumer GPUs. The approach, scripts, and lessons here are generalizable to other Transformer models, and the troubleshooting notes serve as a practical guide for practitioners facing similar deployment challenges.
+1. Corrected the metric to **E2E**;
+2. Used **Nsight/logs** to find the real bottleneck;
+3. Applied a **minimal, effective O1** for **30–43%** E2E reduction;
+4. Objectively explained **why TensorRT loses to PyTorch under this path**, and outlined the right next steps.
 
-> **Takeaway for interviewers:**
-> This project shows how to take a research model, optimize it for real-world deployment, and systematically address every engineering bottleneck. You can expect the same mindset and thoroughness in my future work.

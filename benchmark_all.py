@@ -1,6 +1,8 @@
 from run_pytorch import run_pytorch_benchmark
 from run_onnx import run_onnx_benchmark
 from run_tensorrt import run_tensorrt_benchmark
+from run_tensorrt_O1 import run_tensorrt_benchmark as run_tensorrt_O1_benchmark
+
 
 prompt = "TensorRT is"
 batch_size = 8
@@ -22,3 +24,10 @@ print("\n===== TensorRT Benchmark =====")
 lat, shape, dec = run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat)
 print(f"TensorRT latency: {lat:.2f} ms, output shape: {shape}")
 print("Decoded:", dec)
+
+print("\n===== TensorRT O1 Benchmark =====")
+lat, shape, dec = run_tensorrt_O1_benchmark(prompt, batch_size, seq_len, repeat)
+print(f"TensorRT latency: {lat:.2f} ms, output shape: {shape}")
+print("Decoded:", dec)
+
+

@@ -94,7 +94,7 @@ def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
             cur_input_ids = input_ids.copy()
             cur_attn_mask = attention_mask.copy()
             batch, seq = cur_input_ids.shape
-
+            start = time.time()
             # allocate output
             for _ in range(seq_len):
                 context.set_binding_shape(0, cur_input_ids.shape)
@@ -111,10 +111,10 @@ def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
                 memcpy_htod(d_input_ids, cur_input_ids)
                 memcpy_htod(d_attention_mask, cur_attn_mask)
 
-                start = time.time()
+                
                 context.execute_v2(bindings)
                 cuda.cudaDeviceSynchronize()
-                end = time.time()
+                
 
                 memcpy_dtoh(output, d_output)
 
@@ -128,7 +128,7 @@ def run_tensorrt_benchmark(prompt, batch_size, seq_len, repeat):
                 cuda.cudaFree(d_input_ids)
                 cuda.cudaFree(d_attention_mask)
                 cuda.cudaFree(d_output)
-
+            end = time.time()
             latencies.append((end - start) * 1000)
             decodes.append(tokenizer.batch_decode(cur_input_ids, skip_special_tokens=True))
 
