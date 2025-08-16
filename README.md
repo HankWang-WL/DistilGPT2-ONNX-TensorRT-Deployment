@@ -1,6 +1,6 @@
 # DistilGPT2-ONNX-TensorRT-Deployment
 
->  This README focuses on **end-to-end (E2E)** latency. It documents how I used Nsight/logs to locate bottlenecks, implemented a **minimal O1 optimization**, and why under this setup **TensorRT (E2E)** is still slower than **PyTorch (E2E)**.
+> This README focuses on **end-to-end (E2E)** latency. It documents how I used Nsight/logs to locate bottlenecks, implemented a **minimal O1 optimization**, and why under this setup **TensorRT (E2E)** is still slower than **PyTorch (E2E)**.
 
 ---
 
@@ -12,7 +12,7 @@ This project demonstrates exporting Hugging Face **DistilGPT2** to ONNX and runn
 * **E2E metrics**: compare *real* end‑to‑end latency, not kernel-only time.
 * **Debug → Verify → Tradeoffs**: Nsight Systems + ONNX verbose logs for evidence; apply targeted optimization (O1) and openly describe limitations.
 
-> **Bottom line:** We measure true end-to-end latency. A minimal O1 (pre-alloc + last-step logits only) cuts E2E by 30–43%, but PyTorch `generate` remains faster **because it uses a KV cache (O(L))** while our TRT path is **O(L²)**. **To close the gap, add a KV cache**
+> **Bottom line:** We measure true end-to-end latency. A minimal O1 (pre-alloc + last-step logits only) cuts E2E by **30–43%**, but PyTorch `generate` remains faster **because it uses a KV cache (O(L))** while our TRT path is **O(L²)**. **To close the gap, add a KV cache**
 
 
 
@@ -52,7 +52,7 @@ DistilGPT2-ONNX-TensorRT-Deployment/
 ├── benchmark_all.py       # Run all benchmarks & aggregate
 ├── run_pytorch.py         # PyTorch baseline
 ├── run_onnx.py            # ONNX Runtime baseline
-├── run_tensorrt.py        # TensorRT baseline (early kernel-only measurement)
+├── run_tensorrt.py        # TensorRT baseline 
 ├── run_tensorrt_O1.py     # TensorRT O1 (E2E: prealloc + D2H last-step only)
 ├── images/
 │   ├── nsight_onnx_memcpy.PNG
@@ -231,26 +231,27 @@ To validate functional correctness, I compared decoded outputs from the TensorRT
 
 **Interpretation**
 
-* **O1** (minimal changes) delivers **30–43%** E2E reduction:
+* **O1 optimization** (minimal changes) yields a **30–43% reduction in E2E latency**:
 
-  * Change A: **Pre‑allocate & reuse device buffers** (remove per‑step malloc/free).
-  * Change B: **D2H only the last step `[B, vocab_size]` logits** (do not transfer the full `[B, cur_len, vocab_size]`).
-* Still, without **KV cache**, TRT recomputes the whole sequence each step and I/O remains on the critical path → **still slower than PyTorch E2E**.
+  * **Change A:** Pre‑allocate and reuse device buffers (remove per‑step malloc/free).
+  * **Change B:** Transfer back only the last‑step logits `[B, vocab_size]` instead of the full `[B, cur_len, vocab_size]`.
+* Even after O1, TensorRT remains slower than PyTorch on E2E because the current path lacks a **KV cache**: each step recomputes the entire sequence (O(L²)), and I/O still dominates.
 
-> Earlier I also measured **kernel‑only** (just `execute_v2` + a sync) and saw very small numbers. Nsight showed that is **not E2E**: real deployments include H2D/D2H. This README reports **E2E** to avoid confusion.
+> At first I only measured `execute_v2` (kernel‑window), which includes kernel execution plus host synchronization but excludes H2D/D2H transfers and malloc/free. Later I switched to reporting **true E2E latency** (H2D → kernels → D2H → sync), which reflects real deployment cost.
 
-### Sanity check: Kernel‑only vs E2E (TensorRT)
+### Sanity Check: exe\_v2 vs E2E (TensorRT)
 
-| batch, seq | TRT kernel‑only (ms) | TRT E2E (ms) | TRT E2E O1 (ms) | E2E / Kernel‑only (×) | O1 drop |
-| ---------- | -------------------: | -----------: | --------------: | --------------------: | ------: |
-| b=1,  L=12 |                 7.08 |        66.61 |           57.86 |                 9.41× |   13.1% |
-| b=8,  L=12 |                 8.41 |       105.13 |           73.24 |                12.50× |   30.3% |
-| b=16, L=12 |                15.65 |       170.67 |          102.03 |                10.91× |   40.2% |
-| b=8,  L=8  |                 8.85 |        50.02 |           34.22 |                 5.65× |   31.6% |
-| b=8,  L=16 |                 9.07 |       170.80 |          110.50 |                18.83× |   35.3% |
-| b=8,  L=32 |                16.53 |       628.14 |          355.64 |                38.00× |   43.4% |
+| batch, seq | TRT exe\_v2 (ms) | TRT E2E (ms) | TRT E2E O1 (ms) | E2E / exe\_v2 (×) | O1 drop |
+| ---------- | ---------------: | -----------: | --------------: | ----------------: | ------: |
+| b=1,  L=12 |            56.58 |        66.61 |           57.86 |             1.18× |   13.1% |
+| b=8,  L=12 |            66.16 |       105.13 |           73.24 |             1.59× |   30.3% |
+| b=16, L=12 |            91.85 |       170.67 |          102.03 |             1.86× |   40.2% |
+| b=8,  L=8  |            33.43 |        50.02 |           34.22 |             1.50× |   31.6% |
+| b=8,  L=16 |           101.30 |       170.80 |          110.50 |             1.69× |   35.3% |
+| b=8,  L=32 |           338.33 |       628.14 |          355.64 |             1.86× |   43.4% |
 
-> **Read**: kernel‑only reflects GPU kernel time only. **E2E includes H2D/D2H and sync**, hence **5.6–38×** larger than kernel‑only. O1 (pre‑alloc + last‑step logits only) reduces E2E by **30–43%**, but without KV cache the O(L²) recompute and I/O still dominate.
+> **Read:** `exe_v2` (kernel‑window) = kernel execution + host sync, without H2D/D2H or malloc/free. **E2E** = full pipeline cost including transfers and sync. **O1** reduces E2E by 30–43%, but without KV cache the O(L²) recomputation and transfers remain the bottleneck.
+
 
 ---
 
@@ -402,30 +403,29 @@ cudaFree(output_ptr)
 
 The following issues were encountered during this project, with concise explanations and recommended solutions:
 
-### 🔸 **Prefer end‑to‑end (E2E) over kernel‑only**
+### 🔸 \*\* Prefer true end‑to‑end (E2E) over exe\_v2 (kernel-window)\*\*
 
-**Why:** Kernel‑only timing omits host↔device transfers Host→Device (H2D) / Device→Host (D2H) and synchronization. In real deployments these costs can be as large—or larger—than the kernel time, so kernel‑only numbers often paint an overly optimistic picture.
+**Why:**  exe\_v2 (kernel-window) timing omits host↔device transfers (H2D / D2H) and allocation costs. In real deployments these can be as large—or larger—than kernel execution itself, so exe\_v2 numbers often look overly optimistic.
 
 **What to report:** Use **E2E latency** as the primary metric: **H2D → compute → D2H + any required sync** across the entire decode loop.
 
-**If you keep kernel‑only:** Put it in an appendix (or a separate file) and label it clearly as "kernel‑only (no transfers, no sync)" to prevent misinterpretation.
-
-
 ### 🔸 **Engine Profile Not Covering Autoregressive Sequence Lengths**
 
-- **This is the most common and severe pitfall when deploying autoregressive Transformers with TensorRT.**
-- If the TensorRT engine is built with a fixed sequence length (e.g., only `seq_len=12`), **autoregressive decoding**—where the sequence length grows with each generated token—will immediately trigger shape mismatch errors or even `CUDA Error 700 (illegal memory access)` at runtime.
-- Example error:
-    ```
-    Error Code 3: API Usage Error ... Supplied binding dimension [16,5] ... but profile is 12
-    Error Code 1: Cuda Runtime (an illegal memory access was encountered)
-    ```
+* **This is the most common and severe pitfall when deploying autoregressive Transformers with TensorRT.**
 
-- **Solution:**  
-Always build the engine with `--minShapes` and `--maxShapes` covering the *entire* range of sequence lengths needed for incremental generation (e.g., `--minShapes=input_ids:1x1 --maxShapes=input_ids:16x32`).  
-This ensures all dynamic input shapes used during autoregressive inference are supported by the engine profile.  
-*If you forget this, TensorRT will not be able to run incremental generation at all.*
+* If the TensorRT engine is built with a fixed sequence length (e.g., only `seq_len=12`), **autoregressive decoding**—where the sequence length grows with each generated token—will immediately trigger shape mismatch errors or even `CUDA Error 700 (illegal memory access)` at runtime.
 
+* Example error:
+
+  ```
+  Error Code 3: API Usage Error ... Supplied binding dimension [16,5] ... but profile is 12
+  Error Code 1: Cuda Runtime (an illegal memory access was encountered)
+  ```
+
+* **Solution:**
+  Always build the engine with `--minShapes` and `--maxShapes` covering the *entire* range of sequence lengths needed for incremental generation (e.g., `--minShapes=input_ids:1x1 --maxShapes=input_ids:16x32`).
+  This ensures all dynamic input shapes used during autoregressive inference are supported by the engine profile.
+  *If you forget this, TensorRT will not be able to run incremental generation at all.*
 
 ### 🔸 **Unsupported Ops during ONNX Export**
 
@@ -448,41 +448,41 @@ When attempting to export DistilGPT2 using the standard Python `torch.onnx.expor
 
 > When exporting transformer models, always prefer the official `transformers.onnx` export command. If a direct Python export fails, try the CLI utility—these often include custom handling and optimizations for complex transformer operations.
 
-### 🔸 **Autoregressive Model Deployment Issues**
+### 🔸 **Autoregressive Input Handling**
 
-- Autoregressive models like DistilGPT2 require careful handling of incremental inference.
-- Solution: Ensure the attention mask and input tensors correctly reflect the autoregressive nature. Provide full-length inputs and masks explicitly, and avoid unnecessary recomputations.
+* Autoregressive models like DistilGPT2 require careful handling of incremental inference.
+* Both `input_ids` and `attention_mask` must be updated step by step (append new token and extend the mask).
+* Their dimensions and data types must always match (batch & sequence length, typically int32).
+* If they diverge, TensorRT will throw runtime shape errors; if not updated correctly, the model will recompute or mis-handle history.
 
 ### 🔸 **trtexec Command Not Found on Windows**
 
-- TensorRT’s CLI tool (`trtexec.exe`) not found in default Windows PATH.
-- Solution: Add TensorRT’s `bin/` directory (typically: `C:\TensorRT-8.6.x.x\bin`) to Windows PATH or run directly from that folder.
+* TensorRT’s CLI tool (`trtexec.exe`) not found in default Windows PATH.
+* Solution: Add TensorRT’s `bin/` directory (typically: `C:\TensorRT-8.6.x.x\bin`) to Windows PATH or run directly from that folder.
 
 ### 🔸 **TensorRT Engine Profile Constraints & Shape Errors**
 
-- Inputs must fall within the specified min-max range used to build the TensorRT engine.
-- Solution:
-  - Set appropriate `minShapes`, `optShapes`, and `maxShapes` when building the engine.
-  - If encountering "profileMinDims <= dimensions.d[i]" errors at runtime, rebuild engine with an expanded shape profile or adjust input shape accordingly.
+* Inputs must fall within the specified min-max range used to build the TensorRT engine.
+* Solution:
 
-### 🔸 **Mismatch between `input_ids` and `attention_mask`**
-
-- `input_ids` and `attention_mask` dimensions or data types must exactly match, or TensorRT runtime errors occur.
-- Solution: Always ensure both inputs have identical shapes (batch & sequence length) and consistent data types (typically `int32`).
+  * Set appropriate `minShapes`, `optShapes`, and `maxShapes` when building the engine.
+  * If encountering "profileMinDims <= dimensions.d\[i]" errors at runtime, rebuild engine with an expanded shape profile or adjust input shape accordingly.
 
 ### 🔸 **CUDA Version and Compatibility Issues**
 
-- GTX 1060 (Pascal GPU) supports only up to TensorRT 8.6.x and CUDA 12.x with FP32 precision.
-- Solution: Carefully verify GPU compatibility before installation, as newer CUDA/TensorRT versions might not support older GPUs.
+* GTX 1060 (Pascal GPU) supports only up to TensorRT 8.6.x and CUDA 12.x with FP32 precision.
+* Solution: Carefully verify GPU compatibility before installation, as newer CUDA/TensorRT versions might not support older GPUs.
 
 ### 🔸 **Missing cuDNN or CUDA Dependencies**
 
-- TensorRT execution requires appropriate CUDA/cuDNN libraries; missing libraries cause initialization failures.
-- Solution: Install TensorRT bundled with compatible CUDA Toolkit and cuDNN versions. Verify installations via:
+* TensorRT execution requires appropriate CUDA/cuDNN libraries; missing libraries cause initialization failures.
+* Solution: Install TensorRT bundled with compatible CUDA Toolkit and cuDNN versions. Verify installations via:
+
 ```bash
 nvcc --version
 nvidia-smi
 ```
+
 
 ---
 
@@ -516,4 +516,73 @@ This project is about *how* I:
 2. Used **Nsight/logs** to find the real bottleneck;
 3. Applied a **minimal, effective O1** for **30–43%** E2E reduction;
 4. Objectively explained **why TensorRT loses to PyTorch under this path**, and outlined the right next steps.
+
+---
+
+# How to Port a PyTorch→ONNX→TensorRT Pipeline to AMD ROCm Environment
+
+## Overview
+
+This document outlines the key considerations and adaptations required to migrate an existing PyTorch→ONNX→TensorRT deployment pipeline from NVIDIA CUDA to AMD ROCm. While the high-level workflow remains similar, several low-level adjustments are needed due to differences in runtime libraries, kernel optimizations, and supported operators.
+
+---
+
+## 1. Environment Setup
+
+* **NVIDIA:** CUDA Toolkit, cuDNN, TensorRT.
+* **AMD:** ROCm stack, MIOpen (analogous to cuDNN), MIGraphX (analogous to TensorRT).
+
+Key difference: NVIDIA provides a tightly integrated toolchain; on AMD, equivalent functionality is spread across ROCm components, requiring careful version alignment.
+
+---
+
+## 2. Model Export (PyTorch → ONNX)
+
+* The PyTorch→ONNX export step remains unchanged.
+* Ensure exported operators are supported in MIGraphX; unsupported ops may require custom kernels or graph rewrites.
+* Operator coverage is generally improving on ROCm but still lags behind TensorRT.
+
+---
+
+## 3. Inference Runtime (ONNX → Deployment)
+
+* **NVIDIA Path:** ONNX Runtime (CUDA EP) or direct TensorRT engine.
+* **AMD Path:** ONNX Runtime (ROCm EP) or MIGraphX runtime.
+* Latency characteristics differ: MIGraphX is competitive but may lack some TensorRT-level kernel fusions.
+
+---
+
+## 4. Profiling & Optimization
+
+* **NVIDIA Tools:** Nsight Systems, Nsight Compute, TensorRT Profiler.
+* **AMD Tools:** rocProfiler, rocTracer, Radeon GPU Profiler.
+
+Optimization mindset remains the same: analyze hotspots, improve kernel launch efficiency, and ensure memory coalescing. However, profiling workflows differ in tooling and visualization.
+
+## 5. Summary
+
+Porting this pipeline to AMD is straightforward because the overall structure (PyTorch → ONNX → Optimized Runtime → Deployment) stays intact.
+
+The main effort lies in:
+
+* Ensuring the ROCm environment is correctly set up.
+
+* Checking operator compatibility in MIGraphX or ONNX Runtime (ROCm EP).
+
+* Profiling with AMD tools instead of Nsight.
+
+* Retuning kernel execution under HIP when needed.
+
+**Bottom line**: Actual performance tuning on ROCm may require additional investigation, but the migration path conceptually mirrors the NVIDIA flow.
+
+---
+
+
+## 👨‍💻 Author
+
+**Wang Chen Han**  
+5G PHY Algorithm Engineer  
+[GitHub: HankWang-WL](https://github.com/HankWang-WL)  
+Email: [hank851107@gmail.com](mailto:hank851107@gmail.com)
+
 
