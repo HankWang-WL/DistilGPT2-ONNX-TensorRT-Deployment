@@ -186,16 +186,11 @@ trtexec --onnx=onnx/model.onnx --saveEngine=distilgpt2_fp32.engine \
 - **Red** = `cudaMemcpy` （Host→Device（H2D）/ Device→Host（D2H） transfers）
 - **Green** = host/device sync (e.g., `cudaStreamSynchronize`), i.e., CPU waiting; it overlaps with device work and is **not additional GPU time** to be added again.
 
-**Two common latency definitions:**
-1) **Kernel-only** — measure just the GPU compute (e.g., `execute_v2` + a sync). Useful for kernel tuning, but excludes I/O.
-2) **End-to-end (E2E)** — includes H2D → compute → D2H and any required synchronization. This best reflects real deployment behavior and is what this README reports as the primary metric.
-
-
 ---
 
 ## Debugging Storyline (how I found and fixed the metrics)
 
-1. **Initial observation**: TensorRT looked fast under **kernel-only** timing.
+1. **Initial observation**: TensorRT looked fast under `execute_v2` (kernel‑window) timing.
 2. **Switch to E2E**: I timed **H2D → compute → D2H** with NVTX ranges. **Nsight** revealed large memcpy bars and host waits that kernel-only had skipped.
 3. **ONNX logs → hypothesis**: **ONNX verbose logs** showed CPU fallbacks and inserted Memcpy nodes. That explained ONNX’s E2E lag and suggested a direction: **transfers and per-step allocations are the real pain**. *(No TensorRT verbose was used.)*
 4. **Apply the idea on TensorRT (O1)**: After moving to TRT (no CPU fallbacks), Nsight still showed transfers dominating. I implemented **O1**—**pre-allocate** device buffers and **copy back only the last-step logits**—to attack the transfer/alloc overhead directly.
